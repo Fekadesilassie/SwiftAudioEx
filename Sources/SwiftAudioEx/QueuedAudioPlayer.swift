@@ -222,6 +222,20 @@ public class QueuedAudioPlayer: AudioPlayer, QueueManagerDelegate {
         )
         lastItem = currentItem
         lastIndex = currentIndex
+
+        // Prefetch the next track for gapless transition
+        prefetchNextTrack()
+    }
+
+    private func prefetchNextTrack() {
+        guard let nextItem = queue.nextItems.first else { return }
+        let urlString = nextItem.getSourceUrl()
+        let sourceType = nextItem.getSourceType()
+        let url: URL? = sourceType == .file
+            ? URL(fileURLWithPath: urlString)
+            : URL(string: urlString)
+        guard let url = url else { return }
+        (wrapper as? AVPlayerWrapper)?.prefetchNextItem(url: url)
     }
 
     func onSkippedToSameCurrentItem() {

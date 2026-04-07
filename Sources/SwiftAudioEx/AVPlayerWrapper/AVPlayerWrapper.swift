@@ -23,7 +23,7 @@ public enum PlaybackEndedReason: String {
 class AVPlayerWrapper: AVPlayerWrapperProtocol {
     // MARK: - Properties
     
-    fileprivate var avPlayer = AVPlayer()
+    fileprivate var avPlayer = AVQueuePlayer()
     private let playerObserver = AVPlayerObserver()
     internal let playerTimeObserver: AVPlayerTimeObserver
     private let playerItemNotificationObserver = AVPlayerItemNotificationObserver()
@@ -37,6 +37,9 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
         label: "AVPlayerWrapper.stateQueue",
         attributes: .concurrent
     )
+
+    /// URL of the prefetched next track (if any)
+    private var prefetchedURL: URL?
 
     public init() {
         playerTimeObserver = AVPlayerTimeObserver(periodicObserverTimeInterval: timeEventFrequency.getTime())
@@ -112,10 +115,7 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
     }
     
     var duration: TimeInterval {
-        if let seconds = currentItem?.asset.duration.seconds, !seconds.isNaN {
-            return seconds
-        }
-        else if let seconds = currentItem?.duration.seconds, !seconds.isNaN {
+        if let seconds = currentItem?.duration.seconds, !seconds.isNaN {
             return seconds
         }
         else if let seconds = currentItem?.seekableTimeRanges.last?.timeRangeValue.duration.seconds,
@@ -227,36 +227,58 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
         self.delegate?.AVWrapper(failedWithError: error)
     }
     
-    // AVPlayerWrapper line 230
     func load() {
         if (state == .failed) {
             recreateAVPlayer()
-        } else {
-            clearCurrentItem()
         }
-        
+
+        // Check if the next item in the AVQueuePlayer matches the URL we want
+        if let url = url, let prefetched = prefetchedURL, prefetched == url,
+           avPlayer.items().count > 1,
+           let nextItem = avPlayer.items().dropFirst().first,
+           (nextItem.asset as? AVURLAsset)?.url == url {
+            // Gapless transition — advance to the already-buffered item
+            stopObservingAVPlayerItem()
+            asset?.cancelLoading()
+            prefetchedURL = nil
+            state = .loading
+
+            asset = nextItem.asset
+            item = nextItem
+            avPlayer.advanceToNextItem()
+            startObservingAVPlayer(item: nextItem)
+            applyAVPlayerRate()
+
+            if let initialTime = timeToSeekToAfterLoading {
+                timeToSeekToAfterLoading = nil
+                seek(to: initialTime)
+            }
+            return
+        }
+
+        // Standard path — clear and load fresh
+        clearCurrentItem()
+
         if let url = url {
             let pendingAsset = AVURLAsset(url: url, options: urlOptions)
             asset = pendingAsset
             state = .loading
-            
+
             Task { @MainActor in
                 do {
-                    // Load common metadata
+                    // Load metadata
                     let commonMetadata = try await pendingAsset.load(.commonMetadata)
                     if !commonMetadata.isEmpty {
                         delegate?.AVWrapper(didReceiveCommonMetadata: commonMetadata)
                     }
-                    
-                    // Load chapter metadata
+
                     let chapterLocales = try await pendingAsset.load(.availableChapterLocales)
-                    if chapterLocales.count > 0 {
+                    if !chapterLocales.isEmpty {
                         for locale in chapterLocales {
-                          let chapters = try await pendingAsset.loadChapterMetadataGroups(withTitleLocale: locale)
+                            let chapters = try await pendingAsset.loadChapterMetadataGroups(withTitleLocale: locale)
                             delegate?.AVWrapper(didReceiveChapterMetadata: chapters)
                         }
                     } else {
-                        // Fallback to timed metadata if no chapters
                         let formats = try await pendingAsset.load(.availableMetadataFormats)
                         for format in formats {
                             let timeRange = CMTimeRange(
@@ -268,23 +290,25 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
                             delegate?.AVWrapper(didReceiveTimedMetadata: [group])
                         }
                     }
-                    
-                    // Check if asset is playable
+
+                    // Check playability
                     let isPlayable = try await pendingAsset.load(.isPlayable)
                     guard isPlayable else {
                         playbackFailed(error: AudioPlayerError.PlaybackError.itemWasUnplayable)
                         return
                     }
-                    
-                    // Create player item
+
+                    guard pendingAsset == self.asset else { return }
+
+                    // Create player item and insert into queue
                     let item = AVPlayerItem(asset: pendingAsset)
                     self.item = item
                     item.preferredForwardBufferDuration = bufferDuration
-                    avPlayer.replaceCurrentItem(with: item)
+                    avPlayer.removeAllItems()
+                    avPlayer.insert(item, after: nil)
                     startObservingAVPlayer(item: item)
                     applyAVPlayerRate()
-                    
-                    // Seek to initial time if needed
+
                     if let initialTime = timeToSeekToAfterLoading {
                         timeToSeekToAfterLoading = nil
                         seek(to: initialTime)
@@ -292,6 +316,47 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
                 } catch {
                     playbackFailed(error: AudioPlayerError.PlaybackError.failedToLoadKeyValue)
                 }
+            }
+        }
+    }
+
+    /// Prefetch the next track's asset so it's ready for gapless advance.
+    func prefetchNextItem(url: URL) {
+        // Don't re-prefetch if already queued
+        if prefetchedURL == url { return }
+
+        // Remove any existing prefetched items from the queue (keep only current)
+        while avPlayer.items().count > 1 {
+            if let last = avPlayer.items().last {
+                avPlayer.remove(last)
+            }
+        }
+
+        prefetchedURL = url
+        let nextAsset = AVURLAsset(url: url)
+
+        Task {
+            do {
+                let (isPlayable, _) = try await nextAsset.load(.isPlayable, .duration)
+                guard isPlayable else { return }
+                let nextItem = AVPlayerItem(asset: nextAsset)
+                nextItem.preferredForwardBufferDuration = 30
+                await MainActor.run {
+                    guard self.prefetchedURL == url else { return }
+                    self.avPlayer.insert(nextItem, after: nil)
+                }
+            } catch {
+                // Prefetch failure is non-fatal — load() will handle it normally
+            }
+        }
+    }
+
+    /// Clear any prefetched items from the queue.
+    func clearPrefetchedItems() {
+        prefetchedURL = nil
+        while avPlayer.items().count > 1 {
+            if let last = avPlayer.items().last {
+                avPlayer.remove(last)
             }
         }
     }
@@ -361,11 +426,12 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
     private func clearCurrentItem() {
         guard let asset = asset else { return }
         stopObservingAVPlayerItem()
-        
+
         asset.cancelLoading()
         self.asset = nil
-        
-        avPlayer.replaceCurrentItem(with: nil)
+        prefetchedURL = nil
+
+        avPlayer.removeAllItems()
     }
     
     private func startObservingAVPlayer(item: AVPlayerItem) {
@@ -386,7 +452,7 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
         stopObservingAVPlayerItem()
         clearCurrentItem()
 
-        avPlayer = AVPlayer();
+        avPlayer = AVQueuePlayer()
         setupAVPlayer()
 
         delegate?.AVWrapperDidRecreateAVPlayer()
@@ -394,7 +460,9 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
     
     private func setupAVPlayer() {
         // disabled since we're not making use of video playback
-        avPlayer.allowsExternalPlayback = false;
+        avPlayer.allowsExternalPlayback = false
+        // Prevent AVQueuePlayer from auto-advancing; the library manages track transitions
+        avPlayer.actionAtItemEnd = .none
 
         playerObserver.player = avPlayer
         playerObserver.startObserving()
