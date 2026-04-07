@@ -321,26 +321,22 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
     }
 
     /// Prefetch the next track's asset so it's ready for gapless advance.
+    /// Must be called from the main thread.
     func prefetchNextItem(url: URL) {
-        // Don't re-prefetch if already queued
+        assert(Thread.isMainThread)
         if prefetchedURL == url { return }
 
-        // Remove any existing prefetched items from the queue (keep only current)
-        while avPlayer.items().count > 1 {
-            if let last = avPlayer.items().last {
-                avPlayer.remove(last)
-            }
-        }
-
+        removePrefetchedQueueItems()
         prefetchedURL = url
-        let nextAsset = AVURLAsset(url: url)
+        let nextAsset = AVURLAsset(url: url, options: urlOptions)
+        let prefetchBufferDuration = max(bufferDuration, 30)
 
         Task {
             do {
                 let (isPlayable, _) = try await nextAsset.load(.isPlayable, .duration)
                 guard isPlayable else { return }
                 let nextItem = AVPlayerItem(asset: nextAsset)
-                nextItem.preferredForwardBufferDuration = 30
+                nextItem.preferredForwardBufferDuration = prefetchBufferDuration
                 await MainActor.run {
                     guard self.prefetchedURL == url else { return }
                     self.avPlayer.insert(nextItem, after: nil)
@@ -352,12 +348,18 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
     }
 
     /// Clear any prefetched items from the queue.
+    /// Must be called from the main thread.
     func clearPrefetchedItems() {
+        assert(Thread.isMainThread)
         prefetchedURL = nil
-        while avPlayer.items().count > 1 {
-            if let last = avPlayer.items().last {
-                avPlayer.remove(last)
-            }
+        removePrefetchedQueueItems()
+    }
+
+    /// Remove all items from the AVQueuePlayer except the current one.
+    private func removePrefetchedQueueItems() {
+        let items = avPlayer.items()
+        for item in items.dropFirst() {
+            avPlayer.remove(item)
         }
     }
     
