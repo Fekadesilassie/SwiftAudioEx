@@ -72,7 +72,18 @@ class AVPlayerWrapper: AVPlayerWrapperProtocol {
                 let currentState = self._state
                 if (currentState != newValue) {
                     self._state = newValue
-                    self.delegate?.AVWrapper(didChangeState: newValue)
+                    // The announcement must happen OUTSIDE this queue: the
+                    // delegate chain (setTimePitchingAlgorithmForCurrentItem →
+                    // QueuedAudioPlayer.currentItem) takes the QueueManager
+                    // lock, and the main thread can hold that lock while
+                    // blocked in this property's getter — announcing under the
+                    // barrier closes a three-way deadlock circle that the iOS
+                    // watchdog kills after 10 seconds (0x8BADF00D).
+                    // State-change announcements therefore always arrive on
+                    // the main queue, asynchronously.
+                    DispatchQueue.main.async {
+                        self.delegate?.AVWrapper(didChangeState: newValue)
+                    }
                 }
             }
         }
